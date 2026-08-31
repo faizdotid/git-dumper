@@ -6,14 +6,26 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 )
 
+// Log prefixes keep the output scannable:
+//
+//	[*] progress / info        (stdout)
+//	[=] skipped, already done  (stdout)
+//	[!] warning, recoverable   (stderr)
+//	[-] failure / rejection    (stderr)
+var logMu sync.Mutex
+
 func printf(format string, args ...interface{}) {
+	logMu.Lock()
+	defer logMu.Unlock()
 	fmt.Fprintf(os.Stdout, format, args...)
-	os.Stdout.Sync()
 }
 
 func eprintf(format string, args ...interface{}) {
+	logMu.Lock()
+	defer logMu.Unlock()
 	fmt.Fprintf(os.Stderr, format, args...)
 }
 
@@ -60,7 +72,7 @@ func sanitizeFile(path string) {
 
 	modified := unsafeConfigLine.ReplaceAll(content, []byte("# $0"))
 	if string(content) != string(modified) {
-		printf("Warning: '%s' file was altered\n", path)
+		eprintf("[!] '%s' was altered: commented out unsafe config lines (fsmonitor/sshcommand/askpass/editor/pager)\n", path)
 		os.WriteFile(path, modified, 0o644)
 	}
 }

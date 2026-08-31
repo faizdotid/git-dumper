@@ -75,7 +75,7 @@ func processTasks(initialTasks, tasksDone []string, jobs int, fn TaskFunc) {
 func doTaskSafe(fn TaskFunc, task string) (result []string) {
 	defer func() {
 		if r := recover(); r != nil {
-			eprintf("Task %s raised exception: %v\n", task, r)
+			eprintf("[-] Task %s failed unexpectedly: %v\n", task, r)
 			result = nil
 		}
 	}()

@@ -28,13 +28,13 @@ func isHTML(resp *http.Response) bool {
 // an error message format when the response should be rejected.
 func verifyResponse(resp *http.Response, anyStatus bool) (bool, string) {
 	if !anyStatus && resp.StatusCode != 200 {
-		return false, "[-] %s/%s responded with status code %d\n"
+		return false, "[-] %s/%s: unexpected HTTP status %d\n"
 	}
 	if resp.Header.Get("Content-Length") == "0" {
-		return false, "[-] %s/%s responded with a zero-length body\n"
+		return false, "[-] %s/%s: zero-length body (nothing to save)\n"
 	}
 	if isHTML(resp) {
-		return false, "[-] %s/%s responded with HTML\n"
+		return false, "[-] %s/%s: responded with HTML (%s), not a git file\n"
 	}
 	return true, ""
 }
@@ -47,6 +47,9 @@ func (f *fetcher) reject(resp *http.Response, path, msg string) {
 	args := []interface{}{f.cfg.URL, path}
 	if strings.Contains(msg, "%d") {
 		args = append(args, resp.StatusCode)
+	}
+	if strings.Contains(msg, "(%s)") {
+		args = append(args, resp.Header.Get("Content-Type"))
 	}
 	eprintf(msg, args...)
 }
@@ -108,18 +111,18 @@ func getIndexedFiles(body io.Reader) []string {
 // downloadTask downloads a single file (DownloadWorker).
 func (f *fetcher) downloadTask(path string) []string {
 	if fileExists(filepath.Join(f.cfg.Directory, path)) {
-		printf("[-] Already downloaded %s/%s\n", f.cfg.URL, path)
+		printf("[=] Already downloaded %s/%s\n", f.cfg.URL, path)
 		return nil
 	}
 
 	resp, err := f.request(path)
 	if err != nil {
-		eprintf("[-] %s/%s failed: %s\n", f.cfg.URL, path, err)
+		eprintf("[-] %s/%s: request failed: %s\n", f.cfg.URL, path, err)
 		return nil
 	}
 	defer resp.Body.Close()
 
-	printf("[-] Fetching %s/%s [%d]\n", f.cfg.URL, path, resp.StatusCode)
+	printf("[*] Fetching %s/%s [%d]\n", f.cfg.URL, path, resp.StatusCode)
 
 	if valid, msg := verifyResponse(resp, f.cfg.AnyStatus); !valid {
 		f.reject(resp, path, msg)
@@ -127,7 +130,7 @@ func (f *fetcher) downloadTask(path string) []string {
 	}
 
 	if err := f.writeResponse(resp, path); err != nil {
-		eprintf("[-] %s/%s failed to write: %s\n", f.cfg.URL, path, err)
+		eprintf("[-] %s/%s: failed to write to disk: %s\n", f.cfg.URL, path, err)
 	}
 	return nil
 }
@@ -135,18 +138,18 @@ func (f *fetcher) downloadTask(path string) []string {
 // recursiveDownloadTask downloads a directory recursively (RecursiveDownloadWorker).
 func (f *fetcher) recursiveDownloadTask(path string) []string {
 	if fileExists(filepath.Join(f.cfg.Directory, path)) {
-		printf("[-] Already downloaded %s/%s\n", f.cfg.URL, path)
+		printf("[=] Already downloaded %s/%s\n", f.cfg.URL, path)
 		return nil
 	}
 
 	resp, err := f.request(path)
 	if err != nil {
-		eprintf("[-] %s/%s failed: %s\n", f.cfg.URL, path, err)
+		eprintf("[-] %s/%s: request failed: %s\n", f.cfg.URL, path, err)
 		return nil
 	}
 	defer resp.Body.Close()
 
-	printf("[-] Fetching %s/%s [%d]\n", f.cfg.URL, path, resp.StatusCode)
+	printf("[*] Fetching %s/%s [%d]\n", f.cfg.URL, path, resp.StatusCode)
 
 	// a redirect to path + "/" means path is a directory
 	if (resp.StatusCode == 301 || resp.StatusCode == 302) &&
@@ -156,7 +159,7 @@ func (f *fetcher) recursiveDownloadTask(path string) []string {
 
 	if strings.HasSuffix(path, "/") { // directory index
 		if !isHTML(resp) {
-			eprintf("[-] %s/%s responded with non-HTML directory index\n", f.cfg.URL, path)
+			eprintf("[-] %s/%s: expected HTML directory index, got %s\n", f.cfg.URL, path, resp.Header.Get("Content-Type"))
 			return nil
 		}
 
@@ -174,7 +177,7 @@ func (f *fetcher) recursiveDownloadTask(path string) []string {
 	}
 
 	if err := f.writeResponse(resp, path); err != nil {
-		eprintf("[-] %s/%s failed to write: %s\n", f.cfg.URL, path, err)
+		eprintf("[-] %s/%s: failed to write to disk: %s\n", f.cfg.URL, path, err)
 	}
 	return nil
 }
@@ -185,12 +188,12 @@ var refRegex = regexp.MustCompile(`refs(/[a-zA-Z0-9\-\.\_\*]+)+`)
 func (f *fetcher) findRefsTask(path string) []string {
 	resp, err := f.request(path)
 	if err != nil {
-		eprintf("[-] %s/%s failed: %s\n", f.cfg.URL, path, err)
+		eprintf("[-] %s/%s: request failed: %s\n", f.cfg.URL, path, err)
 		return nil
 	}
 	defer resp.Body.Close()
 
-	printf("[-] Fetching %s/%s [%d]\n", f.cfg.URL, path, resp.StatusCode)
+	printf("[*] Fetching %s/%s [%d]\n", f.cfg.URL, path, resp.StatusCode)
 
 	if valid, msg := verifyResponse(resp, f.cfg.AnyStatus); !valid {
 		f.reject(resp, path, msg)
@@ -199,7 +202,7 @@ func (f *fetcher) findRefsTask(path string) []string {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		eprintf("[-] %s/%s failed to read: %s\n", f.cfg.URL, path, err)
+		eprintf("[-] %s/%s: failed to read response body: %s\n", f.cfg.URL, path, err)
 		return nil
 	}
 
@@ -227,16 +230,16 @@ func (f *fetcher) findObjectsTask(obj string) []string {
 	abspath, _ := filepath.Abs(filepath.Join(f.cfg.Directory, path))
 
 	if fileExists(abspath) {
-		printf("[-] Already downloaded %s/%s\n", f.cfg.URL, path)
+		printf("[=] Already downloaded %s/%s\n", f.cfg.URL, path)
 	} else {
 		resp, err := f.request(path)
 		if err != nil {
-			eprintf("[-] %s/%s failed: %s\n", f.cfg.URL, path, err)
+			eprintf("[-] %s/%s: request failed: %s\n", f.cfg.URL, path, err)
 			return nil
 		}
 		defer resp.Body.Close()
 
-		printf("[-] Fetching %s/%s [%d]\n", f.cfg.URL, path, resp.StatusCode)
+		printf("[*] Fetching %s/%s [%d]\n", f.cfg.URL, path, resp.StatusCode)
 
 		if valid, msg := verifyResponse(resp, f.cfg.AnyStatus); !valid {
 			f.reject(resp, path, msg)
@@ -244,7 +247,7 @@ func (f *fetcher) findObjectsTask(obj string) []string {
 		}
 
 		if err := f.writeResponse(resp, path); err != nil {
-			eprintf("[-] %s/%s failed to write: %s\n", f.cfg.URL, path, err)
+			eprintf("[-] %s/%s: failed to write to disk: %s\n", f.cfg.URL, path, err)
 			return nil
 		}
 	}
@@ -252,7 +255,7 @@ func (f *fetcher) findObjectsTask(obj string) []string {
 	// parse object file to find other objects
 	refs, err := getReferencedSHA1(abspath)
 	if err != nil {
-		eprintf("error: unexpected object type in %s: %s\n", abspath, err)
+		eprintf("[-] %s: cannot parse object file: %s\n", abspath, err)
 		return nil
 	}
 	return refs

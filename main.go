@@ -93,14 +93,14 @@ func fetchGit(cfg *Config) int {
 	f := &fetcher{cfg: cfg, client: client}
 
 	if entries, _ := os.ReadDir(cfg.Directory); len(entries) > 0 {
-		printf("Warning: Destination '%s' is not empty\n", cfg.Directory)
+		eprintf("[!] Destination '%s' is not empty, existing files are kept\n", cfg.Directory)
 	}
 
 	// find base url
 	cfg.URL = normalizeURL(cfg.URL)
 
 	// check for /.git/HEAD
-	printf("[-] Testing %s/.git/HEAD ", cfg.URL)
+	printf("[*] Testing %s/.git/HEAD ... ", cfg.URL)
 	resp, err := f.request(".git/HEAD")
 	if err != nil {
 		printf("\nerror: Unable to connect to %s. Error: %s\n", cfg.URL, err)
@@ -124,7 +124,7 @@ func fetchGit(cfg *Config) int {
 	}
 
 	// check for directory listing
-	printf("[-] Testing %s/.git/ ", cfg.URL)
+	printf("[*] Testing %s/.git/ ... ", cfg.URL)
 	resp, err = f.request(".git/")
 	if err != nil {
 		printf("\nerror: Unable to connect to %s. Error: %s\n", cfg.URL, err)
@@ -140,7 +140,7 @@ func fetchGit(cfg *Config) int {
 				continue
 			}
 
-			printf("[-] Fetching .git recursively\n")
+			printf("[*] Fetching .git recursively\n")
 			processTasks(
 				[]string{".git/", ".gitignore"},
 				nil,
@@ -148,10 +148,10 @@ func fetchGit(cfg *Config) int {
 				f.recursiveDownloadTask,
 			)
 
-			printf("[-] Sanitizing .git/config\n")
+			printf("[*] Sanitizing .git/config\n")
 			sanitizeFile(filepath.Join(cfg.Directory, ".git", "config"))
 
-			printf("[-] Running git checkout .\n")
+			printf("[*] Running git checkout .\n")
 			if err := gitCheckout(cfg.Directory, cfg.Proxy, false); err != nil {
 				eprintf("error: git checkout failed: %s\n", err)
 				return 1
@@ -164,7 +164,7 @@ func fetchGit(cfg *Config) int {
 	}
 
 	// no directory listing
-	printf("[-] Fetching common files\n")
+	printf("[*] Fetching common files\n")
 	tasks := []string{
 		".gitignore",
 		".git/COMMIT_EDITMSG",
@@ -188,7 +188,7 @@ func fetchGit(cfg *Config) int {
 	processTasks(tasks, nil, cfg.Jobs, f.downloadTask)
 
 	// find refs
-	printf("[-] Finding refs/\n")
+	printf("[*] Finding refs/\n")
 	tasks = []string{
 		".git/FETCH_HEAD",
 		".git/HEAD",
@@ -236,7 +236,7 @@ func fetchGit(cfg *Config) int {
 	// include user-specified branches
 	for _, branch := range cfg.Branches {
 		if !branchRegex.MatchString(branch) {
-			printf("Warning: ignoring invalid branch name '%s'\n", branch)
+			eprintf("[!] Ignoring invalid branch name '%s' (only [A-Za-z0-9-._] allowed)\n", branch)
 			continue
 		}
 		tasks = append(tasks,
@@ -252,7 +252,7 @@ func fetchGit(cfg *Config) int {
 	processTasks(tasks, nil, cfg.Jobs, f.findRefsTask)
 
 	// find packs
-	printf("[-] Finding packs\n")
+	printf("[*] Finding packs\n")
 	tasks = nil
 
 	infoPacksPath := filepath.Join(cfg.Directory, ".git", "objects", "info", "packs")
@@ -268,7 +268,7 @@ func fetchGit(cfg *Config) int {
 	processTasks(tasks, nil, cfg.Jobs, f.downloadTask)
 
 	// find objects
-	printf("[-] Finding objects\n")
+	printf("[*] Finding objects\n")
 	objs := make(map[string]bool)
 	packedObjs := make(map[string]bool)
 
@@ -305,7 +305,7 @@ func fetchGit(cfg *Config) int {
 		// A corrupt/garbage index (e.g. an error page saved via --any-status)
 		// must not abort the whole dump; skip it and rely on other sources.
 		if entries, err := indexObjects(indexPath); err != nil {
-			eprintf("[-] Skipping unparseable .git/index: %s\n", err)
+			eprintf("[!] Skipping unparseable .git/index: %s\n", err)
 		} else {
 			for _, obj := range entries {
 				objs[obj] = true
@@ -326,7 +326,7 @@ func fetchGit(cfg *Config) int {
 			// A corrupt pack/idx must not abort the dump; skip it and continue.
 			packed, referenced, err := packObjects(packPath, idxPath)
 			if err != nil {
-				eprintf("[-] Skipping unparseable pack %s: %s\n", name, err)
+				eprintf("[!] Skipping unparseable pack %s: %s\n", name, err)
 				continue
 			}
 			for _, obj := range packed {
@@ -339,7 +339,7 @@ func fetchGit(cfg *Config) int {
 	}
 
 	// fetch all objects
-	printf("[-] Fetching objects\n")
+	printf("[*] Fetching objects\n")
 	tasks = nil
 	for obj := range objs {
 		tasks = append(tasks, obj)
@@ -351,7 +351,7 @@ func fetchGit(cfg *Config) int {
 	processTasks(tasks, done, cfg.Jobs, f.findObjectsTask)
 
 	// git checkout
-	printf("[-] Running git checkout .\n")
+	printf("[*] Running git checkout .\n")
 	sanitizeFile(filepath.Join(cfg.Directory, ".git", "config"))
 	gitCheckout(cfg.Directory, cfg.Proxy, true) // ignore errors
 

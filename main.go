@@ -391,6 +391,17 @@ func main() {
 	flag.Var(&branches, "b", "additional branch names to check for, e.g. `-b dev -b prod`")
 	flag.Var(&branches, "branch", "additional branch names to check for, e.g. `-b dev -b prod`")
 
+	// argparse prints help and exits 0 on -h/--help, and some callers (e.g.
+	// wrapper scripts) probe `git-dumper --help` expecting exit code 0;
+	// flag.Parse() would exit 2, so handle it before parsing.
+	for _, arg := range os.Args[1:] {
+		if arg == "-h" || arg == "--help" || arg == "-help" {
+			fmt.Fprintf(os.Stdout, "usage: git-dumper [options] URL DIR\n\nDump a git repository from a website.\n\noptions:\n")
+			flag.PrintDefaults()
+			os.Exit(0)
+		}
+	}
+
 	// argparse accepts flags and positional arguments in any order, while
 	// flag.Parse() stops at the first positional argument; re-parse in a loop
 	// to match that behavior.

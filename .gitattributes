@@ -1,0 +1,4 @@
+# Keep LF in the repository and in every working tree: with core.autocrlf=true
+# (the default on Windows runners) git would otherwise check out CRLF and
+# `gofmt -l` would flag every file as unformatted.
+* text=auto eol=lf

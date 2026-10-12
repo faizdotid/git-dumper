@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -180,6 +181,12 @@ func TestSanitizeConfigContentIdempotent(t *testing.T) {
 }
 
 func TestSanitizeFilePreservesPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows reports synthetic permission bits (0666 for any writable
+		// file), so mode preservation is not observable there.
+		t.Skip("permission bits are not meaningful on Windows")
+	}
+
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config")
 	if err := os.WriteFile(path, []byte("[core]\n\teditor = vim\n"), 0o600); err != nil {

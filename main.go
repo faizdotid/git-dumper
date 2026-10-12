@@ -11,6 +11,12 @@ import (
 	"strings"
 )
 
+const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; rv:78.0) Gecko/20100101 Firefox/78.0"
+
+// zeroSHA1 is the null object id; it appears in `.git/logs/HEAD` and must not
+// be requested.
+const zeroSHA1 = "0000000000000000000000000000000000000000"
+
 // Config holds the validated command-line options.
 type Config struct {
 	URL                   string
@@ -26,6 +32,8 @@ type Config struct {
 	Method                string
 	AnyStatus             bool
 	SkipVerify            bool
+	MaxSize               int64 // maximum response body size in bytes, 0 = unlimited
+	Help                  bool  // -h/--help was given
 }
 
 // stringSlice collects repeatable flags such as -H and -b.
@@ -38,7 +46,7 @@ func (s *stringSlice) Set(v string) error {
 }
 
 var (
-	headRegex    = regexp.MustCompile(`^(ref:.*|[0-9a-f]{40}$)`)
+	headRegex    = regexp.MustCompile(`^(?:ref:.*|[0-9a-f]{40})$`)
 	branchRegex  = regexp.MustCompile(`^[A-Za-z0-9\-\._]+$`)
 	sha1Regex    = regexp.MustCompile(`(^|\s)([a-f0-9]{40})($|\s)`)
 	infoPacksSha = regexp.MustCompile(`pack-([a-f0-9]{40})\.pack`)
@@ -58,14 +66,28 @@ func normalizeURL(url string) string {
 	return url
 }
 
+// gitCheckoutEnv returns the environment for the final `git checkout .`,
+// hardened so that user/system git configuration of the machine cannot be
+// used to execute code while operating on an untrusted repository.
+func gitCheckoutEnv(proxy string) []string {
+	env := append(os.Environ(),
+		"GIT_CONFIG_NOSYSTEM=1",         // ignore /etc/gitconfig
+		"GIT_CONFIG_GLOBAL="+os.DevNull, // ignore ~/.gitconfig
+		"GIT_ATTR_NOSYSTEM=1",           // ignore system gitattributes
+		"GIT_TERMINAL_PROMPT=0",         // never prompt for credentials
+	)
+	if proxy != "" {
+		env = append(env, "ALL_PROXY="+proxy)
+	}
+	return env
+}
+
 // gitCheckout runs `git checkout .` in directory, propagating the proxy
 // through ALL_PROXY like the Python version does.
 func gitCheckout(directory, proxy string, ignoreErrors bool) error {
 	cmd := exec.Command("git", "checkout", ".")
 	cmd.Dir = directory
-	if proxy != "" {
-		cmd.Env = append(os.Environ(), "ALL_PROXY="+proxy)
-	}
+	cmd.Env = gitCheckoutEnv(proxy)
 	if ignoreErrors {
 		devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 		if err == nil {
@@ -78,11 +100,50 @@ func gitCheckout(directory, proxy string, ignoreErrors bool) error {
 	return cmd.Run()
 }
 
+// sanitizeAndCheckout sanitizes `.git/config` and restores the working tree.
+// A missing config is reported instead of silently running git on a partial
+// repository.
+func sanitizeAndCheckout(cfg *Config, ignoreErrors bool) error {
+	configPath := filepath.Join(cfg.Directory, ".git", "config")
+	if !fileExists(configPath) {
+		return fmt.Errorf("%s not found; skipping git checkout", configPath)
+	}
+
+	printf("[*] Sanitizing .git/config\n")
+	if err := sanitizeFile(configPath); err != nil {
+		eprintf("[!] Failed to sanitize %s: %s\n", configPath, err)
+	}
+	printf("[*] Running git checkout .\n")
+	return gitCheckout(cfg.Directory, cfg.Proxy, ignoreErrors)
+}
+
+// objectSHAs scans files (refs, logs, ...) for 40-char SHA1s, skipping the
+// null object id.
+func objectSHAs(paths []string) map[string]bool {
+	objs := make(map[string]bool)
+	for _, path := range paths {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		for _, m := range sha1Regex.FindAllStringSubmatch(string(content), -1) {
+			if m[2] == zeroSHA1 {
+				continue
+			}
+			objs[m[2]] = true
+		}
+	}
+	return objs
+}
+
 // fetchGit dumps a git repository into the output directory.
 func fetchGit(cfg *Config) int {
 	if cfg.Jobs < 1 || cfg.Retry < 1 || cfg.Timeout < 1 {
 		eprintf("error: invalid jobs/retry/timeout\n")
 		return 1
+	}
+	if !idempotentMethods[cfg.Method] && cfg.Retry > 1 {
+		eprintf("[!] --retry is ignored for non-idempotent method %s\n", cfg.Method)
 	}
 
 	client, err := newHTTPClient(cfg)
@@ -115,8 +176,8 @@ func fetchGit(cfg *Config) int {
 		return 1
 	}
 
-	if valid, msg := verifyResponse(resp, cfg.AnyStatus); !valid {
-		f.reject(resp, ".git/HEAD", msg)
+	if valid, reason := verifyResponse(resp, cfg.AnyStatus); !valid {
+		f.reject(resp, ".git/HEAD", reason)
 		return 1
 	} else if !headRegex.MatchString(strings.TrimSpace(string(body))) {
 		eprintf("error: %s/.git/HEAD is not a git HEAD file\n", cfg.URL)
@@ -148,12 +209,8 @@ func fetchGit(cfg *Config) int {
 				f.recursiveDownloadTask,
 			)
 
-			printf("[*] Sanitizing .git/config\n")
-			sanitizeFile(filepath.Join(cfg.Directory, ".git", "config"))
-
-			printf("[*] Running git checkout .\n")
-			if err := gitCheckout(cfg.Directory, cfg.Proxy, false); err != nil {
-				eprintf("error: git checkout failed: %s\n", err)
+			if err := sanitizeAndCheckout(cfg, false); err != nil {
+				eprintf("error: %s\n", err)
 				return 1
 			}
 			return 0
@@ -269,7 +326,6 @@ func fetchGit(cfg *Config) int {
 
 	// find objects
 	printf("[*] Finding objects\n")
-	objs := make(map[string]bool)
 	packedObjs := make(map[string]bool)
 
 	// .git/packed-refs, .git/info/refs, .git/refs/*, .git/logs/*
@@ -289,15 +345,7 @@ func fetchGit(cfg *Config) int {
 		})
 	}
 
-	for _, path := range files {
-		content, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		for _, m := range sha1Regex.FindAllStringSubmatch(string(content), -1) {
-			objs[m[2]] = true
-		}
-	}
+	objs := objectSHAs(files)
 
 	// use .git/index to find objects
 	indexPath := filepath.Join(cfg.Directory, ".git", "index")
@@ -351,79 +399,93 @@ func fetchGit(cfg *Config) int {
 	processTasks(tasks, done, cfg.Jobs, f.findObjectsTask)
 
 	// git checkout
-	printf("[*] Running git checkout .\n")
-	sanitizeFile(filepath.Join(cfg.Directory, ".git", "config"))
-	gitCheckout(cfg.Directory, cfg.Proxy, true) // ignore errors
-
+	if err := sanitizeAndCheckout(cfg, true); err != nil {
+		eprintf("[!] %s\n", err)
+	}
 	return 0
 }
 
-func usage() {
-	fmt.Fprintf(os.Stderr, "usage: git-dumper [options] URL DIR\n\nDump a git repository from a website.\n\noptions:\n")
-	flag.PrintDefaults()
+// cliFlags holds the raw command-line values before validation.
+type cliFlags struct {
+	Config    Config
+	Proxy     string
+	UserAgent string
+	Headers   stringSlice
+	Branches  stringSlice
 }
 
-func main() {
-	flag.Usage = usage
+// newFlagSet registers all flags on a fresh FlagSet. Parse errors are
+// discarded: main prints its own diagnostics and usage.
+func newFlagSet(f *cliFlags) *flag.FlagSet {
+	fs := flag.NewFlagSet("git-dumper", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 
-	var cfg Config
-	var headers, branches stringSlice
-	var proxyArg, userAgent string
+	fs.StringVar(&f.Proxy, "proxy", "", "use the specified proxy")
+	fs.StringVar(&f.Config.Method, "X", "GET", "HTTP method to use for all requests (e.g. GET, POST)")
+	fs.StringVar(&f.Config.Method, "method", "GET", "HTTP method to use for all requests (e.g. GET, POST)")
+	fs.BoolVar(&f.Config.AnyStatus, "any-status", false, "accept any HTTP status code as long as the body is non-empty and not HTML")
+	fs.BoolVar(&f.Config.SkipVerify, "k", false, "skip TLS certificate verification (like curl -k)")
+	fs.BoolVar(&f.Config.SkipVerify, "insecure", false, "skip TLS certificate verification (like curl -k)")
+	fs.StringVar(&f.Config.ClientCertP12, "client-cert-p12", "", "client certificate in PKCS#12")
+	fs.StringVar(&f.Config.ClientCertP12Password, "client-cert-p12-password", "", "password for the client certificate")
+	fs.IntVar(&f.Config.Jobs, "j", 10, "number of simultaneous requests")
+	fs.IntVar(&f.Config.Jobs, "jobs", 10, "number of simultaneous requests")
+	fs.IntVar(&f.Config.Retry, "r", 3, "number of request attempts before giving up")
+	fs.IntVar(&f.Config.Retry, "retry", 3, "number of request attempts before giving up")
+	fs.IntVar(&f.Config.Timeout, "t", 3, "maximum time in seconds before giving up")
+	fs.IntVar(&f.Config.Timeout, "timeout", 3, "maximum time in seconds before giving up")
+	fs.Int64Var(&f.Config.MaxSize, "max-size", 0, "maximum response size to download in bytes (0 = unlimited)")
+	fs.StringVar(&f.UserAgent, "u", defaultUserAgent, "user-agent to use for requests")
+	fs.StringVar(&f.UserAgent, "user-agent", defaultUserAgent, "user-agent to use for requests")
+	fs.Var(&f.Headers, "H", "additional http headers, e.g `NAME=VALUE`")
+	fs.Var(&f.Headers, "header", "additional http headers, e.g `NAME=VALUE`")
+	fs.Var(&f.Branches, "b", "additional branch names to check for, e.g. `-b dev -b prod`")
+	fs.Var(&f.Branches, "branch", "additional branch names to check for, e.g. `-b dev -b prod`")
+	fs.BoolVar(&f.Config.Help, "h", false, "show this help message and exit")
+	fs.BoolVar(&f.Config.Help, "help", false, "show this help message and exit")
 
-	flag.StringVar(&proxyArg, "proxy", "", "use the specified proxy")
-	flag.StringVar(&cfg.Method, "X", "GET", "HTTP method to use for all requests (e.g. GET, POST)")
-	flag.StringVar(&cfg.Method, "method", "GET", "HTTP method to use for all requests (e.g. GET, POST)")
-	flag.BoolVar(&cfg.AnyStatus, "any-status", false, "accept any HTTP status code as long as the body is non-empty and not HTML")
-	flag.BoolVar(&cfg.SkipVerify, "k", false, "skip TLS certificate verification (like curl -k)")
-	flag.BoolVar(&cfg.SkipVerify, "insecure", false, "skip TLS certificate verification (like curl -k)")
-	flag.StringVar(&cfg.ClientCertP12, "client-cert-p12", "", "client certificate in PKCS#12")
-	flag.StringVar(&cfg.ClientCertP12Password, "client-cert-p12-password", "", "password for the client certificate")
-	flag.IntVar(&cfg.Jobs, "j", 10, "number of simultaneous requests")
-	flag.IntVar(&cfg.Jobs, "jobs", 10, "number of simultaneous requests")
-	flag.IntVar(&cfg.Retry, "r", 3, "number of request attempts before giving up")
-	flag.IntVar(&cfg.Retry, "retry", 3, "number of request attempts before giving up")
-	flag.IntVar(&cfg.Timeout, "t", 3, "maximum time in seconds before giving up")
-	flag.IntVar(&cfg.Timeout, "timeout", 3, "maximum time in seconds before giving up")
-	flag.StringVar(&userAgent, "u", "Mozilla/5.0 (Windows NT 10.0; rv:78.0) Gecko/20100101 Firefox/78.0", "user-agent to use for requests")
-	flag.StringVar(&userAgent, "user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:78.0) Gecko/20100101 Firefox/78.0", "user-agent to use for requests")
-	flag.Var(&headers, "H", "additional http headers, e.g `NAME=VALUE`")
-	flag.Var(&headers, "header", "additional http headers, e.g `NAME=VALUE`")
-	flag.Var(&branches, "b", "additional branch names to check for, e.g. `-b dev -b prod`")
-	flag.Var(&branches, "branch", "additional branch names to check for, e.g. `-b dev -b prod`")
+	return fs
+}
 
-	// argparse prints help and exits 0 on -h/--help, and some callers (e.g.
-	// wrapper scripts) probe `git-dumper --help` expecting exit code 0;
-	// flag.Parse() would exit 2, so handle it before parsing.
-	for _, arg := range os.Args[1:] {
-		if arg == "-h" || arg == "--help" || arg == "-help" {
-			fmt.Fprintf(os.Stdout, "usage: git-dumper [options] URL DIR\n\nDump a git repository from a website.\n\noptions:\n")
-			flag.PrintDefaults()
-			os.Exit(0)
-		}
-	}
+// printUsage prints the command-line usage and all flags.
+func printUsage(w io.Writer) {
+	fmt.Fprintf(w, "usage: git-dumper [options] URL DIR\n\nDump a git repository from a website.\n\noptions:\n")
+	var f cliFlags
+	fs := newFlagSet(&f)
+	fs.SetOutput(w)
+	fs.PrintDefaults()
+}
+
+// parseArgs parses and validates the command line. Like argparse it accepts
+// flags and positional arguments in any order. The returned Config has Help
+// set when -h/--help was given.
+func parseArgs(args []string) (*Config, error) {
+	var f cliFlags
+	fs := newFlagSet(&f)
 
 	// argparse accepts flags and positional arguments in any order, while
-	// flag.Parse() stops at the first positional argument; re-parse in a loop
-	// to match that behavior.
+	// FlagSet.Parse stops at the first positional argument; re-parse in a
+	// loop to match that behavior.
 	var positional []string
-	args := os.Args[1:]
-	for len(args) > 0 {
-		flag.CommandLine.Parse(args)
-		args = flag.Args()
-		if len(args) > 0 {
-			positional = append(positional, args[0])
-			args = args[1:]
+	rest := args
+	for len(rest) > 0 {
+		if err := fs.Parse(rest); err != nil {
+			return nil, err
+		}
+		rest = fs.Args()
+		if len(rest) > 0 {
+			positional = append(positional, rest[0])
+			rest = rest[1:]
 		}
 	}
 
-	fail := func(format string, args ...interface{}) {
-		eprintf(format+"\n", args...)
-		os.Exit(2)
+	cfg := &f.Config
+	if cfg.Help {
+		return cfg, nil
 	}
 
 	if len(positional) != 2 {
-		usage()
-		os.Exit(2)
+		return nil, fmt.Errorf("expected URL and DIR arguments, got %d", len(positional))
 	}
 	cfg.URL = positional[0]
 	cfg.Directory = positional[1]
@@ -433,32 +495,37 @@ func main() {
 
 	// jobs
 	if cfg.Jobs < 1 {
-		fail("invalid number of jobs, got `%d`", cfg.Jobs)
+		return nil, fmt.Errorf("invalid number of jobs, got `%d`", cfg.Jobs)
 	}
 
 	// retry
 	if cfg.Retry < 1 {
-		fail("invalid number of retries, got `%d`", cfg.Retry)
+		return nil, fmt.Errorf("invalid number of retries, got `%d`", cfg.Retry)
 	}
 
 	// timeout
 	if cfg.Timeout < 1 {
-		fail("invalid timeout, got `%d`", cfg.Timeout)
+		return nil, fmt.Errorf("invalid timeout, got `%d`", cfg.Timeout)
+	}
+
+	// max-size
+	if cfg.MaxSize < 0 {
+		return nil, fmt.Errorf("invalid max-size, got `%d`", cfg.MaxSize)
 	}
 
 	// header
-	cfg.Headers = map[string]string{"User-Agent": userAgent}
-	for _, header := range headers {
+	cfg.Headers = map[string]string{"User-Agent": f.UserAgent}
+	for _, header := range f.Headers {
 		tokens := strings.SplitN(header, "=", 2)
 		if len(tokens) != 2 {
-			fail("http header must have the form NAME=VALUE, got `%s`", header)
+			return nil, fmt.Errorf("http header must have the form NAME=VALUE, got `%s`", header)
 		}
 		cfg.Headers[strings.TrimSpace(tokens[0])] = strings.TrimSpace(tokens[1])
 	}
-	cfg.Branches = branches
+	cfg.Branches = f.Branches
 
 	// proxy
-	if proxyArg != "" {
+	if f.Proxy != "" {
 		proxyPatterns := []struct {
 			pattern string
 			scheme  string
@@ -470,35 +537,49 @@ func main() {
 		}
 		valid := false
 		for _, p := range proxyPatterns {
-			if m := regexp.MustCompile(p.pattern).FindStringSubmatch(proxyArg); m != nil {
+			if m := regexp.MustCompile(p.pattern).FindStringSubmatch(f.Proxy); m != nil {
 				cfg.Proxy = fmt.Sprintf("%s://%s:%s", p.scheme, m[1], m[2])
 				valid = true
 				break
 			}
 		}
 		if !valid {
-			fail("invalid proxy, got `%s`", proxyArg)
+			return nil, fmt.Errorf("invalid proxy, got `%s`", f.Proxy)
 		}
 	}
 
 	// output directory
 	if err := os.MkdirAll(cfg.Directory, 0o755); err != nil {
-		fail("`%s` is not a directory", cfg.Directory)
+		return nil, fmt.Errorf("`%s` is not a directory", cfg.Directory)
 	}
 	if info, err := os.Stat(cfg.Directory); err != nil || !info.IsDir() {
-		fail("`%s` is not a directory", cfg.Directory)
+		return nil, fmt.Errorf("`%s` is not a directory", cfg.Directory)
 	}
 
 	// client certificate
 	if cfg.ClientCertP12 != "" {
 		if !fileExists(cfg.ClientCertP12) {
-			fail("client certificate `%s` does not exist or is not a file", cfg.ClientCertP12)
+			return nil, fmt.Errorf("client certificate `%s` does not exist or is not a file", cfg.ClientCertP12)
 		}
 		if cfg.ClientCertP12Password == "" {
-			fail("client certificate password is required")
+			return nil, fmt.Errorf("client certificate password is required")
 		}
 	}
 
-	// fetch everything
-	os.Exit(fetchGit(&cfg))
+	return cfg, nil
+}
+
+func main() {
+	cfg, err := parseArgs(os.Args[1:])
+	if err != nil {
+		printUsage(os.Stderr)
+		eprintf("error: %s\n", err)
+		os.Exit(2)
+	}
+	if cfg.Help {
+		printUsage(os.Stdout)
+		os.Exit(0)
+	}
+
+	os.Exit(fetchGit(cfg))
 }

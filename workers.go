@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	urlpkg "net/url"
@@ -24,37 +25,46 @@ func isHTML(resp *http.Response) bool {
 	return strings.Contains(resp.Header.Get("Content-Type"), "text/html")
 }
 
-// verifyResponse mirrors the Python verify_response(). It returns false and
-// an error message format when the response should be rejected.
-func verifyResponse(resp *http.Response, anyStatus bool) (bool, string) {
-	if !anyStatus && resp.StatusCode != 200 {
-		return false, "[-] %s/%s: unexpected HTTP status %d\n"
-	}
-	if resp.Header.Get("Content-Length") == "0" {
-		return false, "[-] %s/%s: zero-length body (nothing to save)\n"
-	}
-	if isHTML(resp) {
-		return false, "[-] %s/%s: responded with HTML (%s), not a git file\n"
-	}
-	return true, ""
+// rejectReason describes why a response was rejected. The format string takes
+// the request URL and path first, followed by any extra args.
+type rejectReason struct {
+	format string
+	args   []interface{}
 }
 
-func (f *fetcher) reject(resp *http.Response, path, msg string) {
+// verifyResponse mirrors the Python verify_response(). It returns false and a
+// reason when the response should be rejected.
+func verifyResponse(resp *http.Response, anyStatus bool) (bool, *rejectReason) {
+	if !anyStatus && resp.StatusCode != 200 {
+		return false, &rejectReason{
+			format: "[-] %s/%s: unexpected HTTP status %d\n",
+			args:   []interface{}{resp.StatusCode},
+		}
+	}
+	if resp.Header.Get("Content-Length") == "0" {
+		return false, &rejectReason{format: "[-] %s/%s: zero-length body (nothing to save)\n"}
+	}
+	if isHTML(resp) {
+		return false, &rejectReason{
+			format: "[-] %s/%s: responded with HTML (%s), not a git file\n",
+			args:   []interface{}{resp.Header.Get("Content-Type")},
+		}
+	}
+	return true, nil
+}
+
+func (f *fetcher) reject(resp *http.Response, path string, reason *rejectReason) {
 	// drain the (usually small) error body so the connection can be reused;
 	// undrained bodies force a new TCP connection for the next request
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 
-	args := []interface{}{f.cfg.URL, path}
-	if strings.Contains(msg, "%d") {
-		args = append(args, resp.StatusCode)
-	}
-	if strings.Contains(msg, "(%s)") {
-		args = append(args, resp.Header.Get("Content-Type"))
-	}
-	eprintf(msg, args...)
+	args := append([]interface{}{f.cfg.URL, path}, reason.args...)
+	eprintf(reason.format, args...)
 }
 
-// writeResponse streams the response body to directory/path.
+// writeResponse streams the response body to directory/path. When
+// cfg.MaxSize > 0, oversized responses are rejected and the partial file is
+// removed.
 func (f *fetcher) writeResponse(resp *http.Response, path string) error {
 	abspath, err := filepath.Abs(filepath.Join(f.cfg.Directory, path))
 	if err != nil {
@@ -70,8 +80,22 @@ func (f *fetcher) writeResponse(resp *http.Response, path string) error {
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, resp.Body)
-	return err
+	var reader io.Reader = resp.Body
+	if f.cfg.MaxSize > 0 {
+		reader = io.LimitReader(resp.Body, f.cfg.MaxSize+1)
+	}
+	n, err := io.Copy(out, reader)
+	if err != nil {
+		out.Close()
+		os.Remove(abspath)
+		return err
+	}
+	if f.cfg.MaxSize > 0 && n > f.cfg.MaxSize {
+		out.Close()
+		os.Remove(abspath)
+		return fmt.Errorf("response exceeds --max-size (%d bytes)", f.cfg.MaxSize)
+	}
+	return nil
 }
 
 // getIndexedFiles returns all the files in a directory index webpage.
@@ -124,8 +148,8 @@ func (f *fetcher) downloadTask(path string) []string {
 
 	printf("[*] Fetching %s/%s [%d]\n", f.cfg.URL, path, resp.StatusCode)
 
-	if valid, msg := verifyResponse(resp, f.cfg.AnyStatus); !valid {
-		f.reject(resp, path, msg)
+	if valid, reason := verifyResponse(resp, f.cfg.AnyStatus); !valid {
+		f.reject(resp, path, reason)
 		return nil
 	}
 
@@ -171,8 +195,8 @@ func (f *fetcher) recursiveDownloadTask(path string) []string {
 	}
 
 	// file
-	if valid, msg := verifyResponse(resp, f.cfg.AnyStatus); !valid {
-		f.reject(resp, path, msg)
+	if valid, reason := verifyResponse(resp, f.cfg.AnyStatus); !valid {
+		f.reject(resp, path, reason)
 		return nil
 	}
 
@@ -195,14 +219,22 @@ func (f *fetcher) findRefsTask(path string) []string {
 
 	printf("[*] Fetching %s/%s [%d]\n", f.cfg.URL, path, resp.StatusCode)
 
-	if valid, msg := verifyResponse(resp, f.cfg.AnyStatus); !valid {
-		f.reject(resp, path, msg)
+	if valid, reason := verifyResponse(resp, f.cfg.AnyStatus); !valid {
+		f.reject(resp, path, reason)
 		return nil
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	var reader io.Reader = resp.Body
+	if f.cfg.MaxSize > 0 {
+		reader = io.LimitReader(resp.Body, f.cfg.MaxSize+1)
+	}
+	body, err := io.ReadAll(reader)
 	if err != nil {
 		eprintf("[-] %s/%s: failed to read response body: %s\n", f.cfg.URL, path, err)
+		return nil
+	}
+	if f.cfg.MaxSize > 0 && int64(len(body)) > f.cfg.MaxSize {
+		eprintf("[-] %s/%s: response exceeds --max-size (%d bytes)\n", f.cfg.URL, path, f.cfg.MaxSize)
 		return nil
 	}
 
@@ -226,6 +258,11 @@ func (f *fetcher) findRefsTask(path string) []string {
 // findObjectsTask downloads an object file and returns the SHA1s it
 // references (FindObjectsWorker).
 func (f *fetcher) findObjectsTask(obj string) []string {
+	if !isSHA1(obj) {
+		eprintf("[-] %s: invalid object id %q\n", f.cfg.URL, obj)
+		return nil
+	}
+
 	path := ".git/objects/" + obj[:2] + "/" + obj[2:]
 	abspath, _ := filepath.Abs(filepath.Join(f.cfg.Directory, path))
 
@@ -241,8 +278,8 @@ func (f *fetcher) findObjectsTask(obj string) []string {
 
 		printf("[*] Fetching %s/%s [%d]\n", f.cfg.URL, path, resp.StatusCode)
 
-		if valid, msg := verifyResponse(resp, f.cfg.AnyStatus); !valid {
-			f.reject(resp, path, msg)
+		if valid, reason := verifyResponse(resp, f.cfg.AnyStatus); !valid {
+			f.reject(resp, path, reason)
 			return nil
 		}
 

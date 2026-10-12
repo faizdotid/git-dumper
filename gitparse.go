@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -127,13 +128,21 @@ func packObjects(packPath, idxPath string) (packedObjs, referencedObjs []string,
 		return nil, nil, err
 	}
 
-	fs := osfs.New("/")
-	file, err := fs.Open(packPath)
+	// Root the billy filesystem at the pack directory so path handling works
+	// on Windows too (osfs.New("/") only makes sense on Unix).
+	packDir := filepath.Dir(packPath)
+	if packDir == "" {
+		packDir = "."
+	}
+	fs := osfs.New(packDir)
+	file, err := fs.Open(filepath.Base(packPath))
 	if err != nil {
 		return nil, nil, err
 	}
 	defer file.Close()
 
+	// A threshold of 0 keeps every object in memory; objects are parsed one
+	// at a time and only commits/trees (small) are read below.
 	pack := packfile.NewPackfile(idx, fs, file, 0)
 
 	entries, err := idx.Entries()
@@ -156,6 +165,14 @@ func packObjects(packPath, idxPath string) (packedObjs, referencedObjs []string,
 			return packedObjs, referencedObjs, err
 		}
 
+		packedObjs = append(packedObjs, entry.Hash.String())
+
+		// Blobs and tags reference no other objects: skip reading (and
+		// decompressing) their content entirely.
+		if typ := obj.Type(); typ != plumbing.CommitObject && typ != plumbing.TreeObject {
+			continue
+		}
+
 		reader, err := obj.Reader()
 		if err != nil {
 			return packedObjs, referencedObjs, err
@@ -166,7 +183,6 @@ func packObjects(packPath, idxPath string) (packedObjs, referencedObjs []string,
 			return packedObjs, referencedObjs, err
 		}
 
-		packedObjs = append(packedObjs, entry.Hash.String())
 		refs, err := referencedSHA1s(obj.Type(), content)
 		if err != nil {
 			// unknown object type: skip instead of aborting the dump

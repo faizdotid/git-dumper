@@ -12,6 +12,12 @@ Compared to the Python version:
 - Much faster (goroutines instead of multiprocessing; ~17x in local benchmarks)
 - TLS certificate verification is **on by default**; use `-k`/`--insecure` to skip it
   (the Python version always skips verification)
+- `.git/config` is sanitized more thoroughly (see [Security](#security)) and
+  `git checkout` runs with a hardened environment
+- Honors `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` when `--proxy` is not given,
+  like `requests` does
+- Keeps cookies across requests (session behavior like `requests.Session`)
+- `--max-size` caps the size of downloaded responses (0 = unlimited)
 
 ## Install
 
@@ -66,10 +72,14 @@ The target `git` binary is required for the final `git checkout .` step.
 -b, --branch NAME            additional branch names to check for (repeatable)
 -X, --method METHOD          HTTP method to use for all requests (default GET)
     --proxy PROXY            proxy: socks5:host:port, socks4:host:port,
-                             http://host:port, or host:port (default socks5)
+                             http://host:port, or host:port (default socks5);
+                             falls back to HTTP_PROXY/HTTPS_PROXY/NO_PROXY
     --any-status             accept any HTTP status code as long as the body is
                              non-empty and not HTML
+    --max-size BYTES         maximum response size to download in bytes
+                             (0 = unlimited, default 0)
 -k, --insecure               skip TLS certificate verification (like curl -k)
+-h, --help                   show this help message and exit
     --client-cert-p12 FILE   client certificate in PKCS#12
     --client-cert-p12-password PASSWORD
                              password for the client certificate
@@ -85,8 +95,32 @@ Flags and positional arguments can be given in any order.
    discovers refs by scanning fetched files, downloads packs listed in
    `objects/info/packs`, then crawls the object graph (commits → trees → blobs)
    to fetch every referenced loose object.
-4. Sanitizes `.git/config` (comments out `fsmonitor`/`sshcommand`/`askpass`/
-   `editor`/`pager` lines) and runs `git checkout .` to restore the working tree.
+4. Sanitizes `.git/config` and runs `git checkout .` to restore the working tree.
+
+## Security
+
+Dumping a repository from a website means fetching and then running `git` on
+**attacker-controlled data**. Always run `git-dumper` in a sandbox, container or
+throwaway VM, and never point it at trusted working directories.
+
+Mitigations built in:
+
+- TLS certificate verification is enabled by default (`-k` disables it).
+- Before `git checkout .`, unsafe `.git/config` keys are commented out:
+  `core.fsmonitor`, `core.sshcommand`, `core.askpass`, `core.editor`,
+  `core.pager`, `core.hooksPath`, `include.path` / `includeIf.*.path` and
+  `filter.*.smudge` / `clean` / `process` / `required`. Both section form
+  (`[core]` + `editor = ...`) and dotted form (`core.editor = ...`) are handled.
+- `git checkout` runs with `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_ATTR_NOSYSTEM=1` and `GIT_TERMINAL_PROMPT=0`, so the machine's global git
+  configuration cannot execute code or prompt for credentials.
+- Download paths are validated against directory traversal (`..`, absolute
+  paths, backslashes).
+- `--max-size` limits the size of downloaded responses if the target is
+  untrusted about disk usage.
+
+Note that this hardening is best-effort: git features beyond configuration
+(e.g. repository content itself) are not sandboxed.
 
 ## License
 

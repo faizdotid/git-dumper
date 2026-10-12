@@ -100,6 +100,22 @@ func gitCheckout(directory, proxy string, ignoreErrors bool) error {
 	return cmd.Run()
 }
 
+// ensureGitDirs creates the directories git requires to recognize a
+// repository. Repositories whose refs are all packed (git pack-refs) never
+// produce any file under `.git/refs` during the download, so the directory has
+// to be created explicitly; without it git reports "not a git repository".
+func ensureGitDirs(directory string) error {
+	for _, dir := range []string{
+		filepath.Join(directory, ".git", "refs"),
+		filepath.Join(directory, ".git", "objects"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // sanitizeAndCheckout sanitizes `.git/config` and restores the working tree.
 // A missing config is reported instead of silently running git on a partial
 // repository.
@@ -107,6 +123,10 @@ func sanitizeAndCheckout(cfg *Config, ignoreErrors bool) error {
 	configPath := filepath.Join(cfg.Directory, ".git", "config")
 	if !fileExists(configPath) {
 		return fmt.Errorf("%s not found; skipping git checkout", configPath)
+	}
+
+	if err := ensureGitDirs(cfg.Directory); err != nil {
+		return err
 	}
 
 	printf("[*] Sanitizing .git/config\n")

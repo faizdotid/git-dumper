@@ -74,25 +74,43 @@ func noListingHandler(root string) http.Handler {
 	})
 }
 
+// packFixture runs the real git binary so all refs and objects end up packed;
+// this is the layout produced by `git gc`, where no file under .git/refs
+// exists after a dump (regression test for the checkout fix).
+func packFixture(t *testing.T, src string) {
+	t.Helper()
+	for _, args := range [][]string{{"gc", "--quiet"}, {"pack-refs", "--all"}} {
+		cmd := exec.Command("git", append([]string{"-C", src}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s\n%s", args, err, out)
+		}
+	}
+}
+
 func TestEndToEnd(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git binary not available for the final checkout")
 	}
 
-	src := t.TempDir()
-	head := initFixtureRepo(t, src)
-
 	modes := []struct {
 		name    string
-		handler http.Handler
+		prepare func(t *testing.T, src string)
+		handler func(src string) http.Handler
 	}{
-		{"with directory listing", http.FileServer(http.Dir(src))},
-		{"without directory listing", noListingHandler(src)},
+		{"with directory listing", nil, func(src string) http.Handler { return http.FileServer(http.Dir(src)) }},
+		{"without directory listing", nil, noListingHandler},
+		{"without directory listing and packed refs", packFixture, noListingHandler},
 	}
 
 	for _, mode := range modes {
 		t.Run(mode.name, func(t *testing.T) {
-			srv := httptest.NewServer(mode.handler)
+			src := t.TempDir()
+			head := initFixtureRepo(t, src)
+			if mode.prepare != nil {
+				mode.prepare(t, src)
+			}
+
+			srv := httptest.NewServer(mode.handler(src))
 			defer srv.Close()
 
 			dump := filepath.Join(t.TempDir(), "dump")

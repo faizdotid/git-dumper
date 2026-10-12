@@ -109,6 +109,26 @@ func TestGitCheckoutEnv(t *testing.T) {
 	}
 }
 
+func TestEnsureGitDirs(t *testing.T) {
+	dir := t.TempDir()
+	if err := ensureGitDirs(dir); err != nil {
+		t.Fatalf("ensureGitDirs: %s", err)
+	}
+	for _, path := range []string{
+		filepath.Join(dir, ".git", "refs"),
+		filepath.Join(dir, ".git", "objects"),
+	} {
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			t.Errorf("directory %s was not created: %v", path, err)
+		}
+	}
+	// idempotent
+	if err := ensureGitDirs(dir); err != nil {
+		t.Errorf("ensureGitDirs is not idempotent: %s", err)
+	}
+}
+
 func TestParseArgs(t *testing.T) {
 	outDir := func(t *testing.T) string {
 		return filepath.Join(t.TempDir(), "out")
